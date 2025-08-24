@@ -188,10 +188,45 @@ def years_between(d0: str, d1: date) -> float:
 
 
 def extract_liquidation_terms(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return liquidation preference classes ordered by latest round date (newest first).
+
+    Previous logic used an explicit ``processing_order`` integer (ascending). We now infer
+    ordering automatically from the event chronology: classes whose rounds occur later
+    should be processed earlier in the waterfall ("latest money first").
+
+    Heuristics:
+    - For each class, find all events whose names are listed in ``applies_to_round_names``.
+    - Take the *latest* date among those events; if a round name is missing or has no date,
+      it's ignored.
+    - Classes are then sorted DESC by that latest date.
+    - Classes with no resolvable date fall to the end (treated as very old).
+    - ``processing_order`` is ignored (still accepted in input but not used for sorting).
+    """
     terms = (raw or {}).get("liquidation_terms", {})
-    classes = terms.get("classes", [])
-    # sort by processing_order (ascending) so lower is processed first (latest investors first)
-    classes_sorted = sorted(classes, key=lambda c: c.get("processing_order", 9999))
+    classes = list(terms.get("classes", []))
+    events = (raw or {}).get("events", [])
+
+    # Build a map round_name -> parsed date
+    round_dates: Dict[str, date] = {}
+    for ev in events:
+        rn = ev.get("name")
+        d = ev.get("date")
+        if rn and d:
+            try:
+                round_dates[rn] = _parse_date(d)
+            except Exception:  # pragma: no cover (defensive)
+                pass
+
+    def latest_date_for_class(c: Dict[str, Any]) -> date:
+        latest: date | None = None
+        for rn in c.get("applies_to_round_names", []) or []:
+            rd = round_dates.get(rn)
+            if rd and (latest is None or rd > latest):
+                latest = rd
+        # If no date found, return a very old sentinel so it sorts last.
+        return latest or date(1900, 1, 1)
+
+    classes_sorted = sorted(classes, key=latest_date_for_class, reverse=True)
     return {"classes": classes_sorted}
 
 
@@ -221,7 +256,6 @@ def build_investment_tranches(events: List[RoundSummary], raw: Dict[str, Any], l
                     "class_name": c.get("name"),
                     "rate": float(c.get("simple_interest_rate")) if c.get("simple_interest_rate") is not None else 0.0,
                     "cap_multiple_total": c.get("cap_multiple_total"),  # may be None
-                    "participating": bool(c.get("participating", True)),
                     "received": 0.0
                 })
     # sort tranches by class processing order
