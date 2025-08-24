@@ -5,6 +5,7 @@ import io
 
 import pandas as pd
 import streamlit as st
+import altair as alt
 
 from datetime import datetime, date
 import math
@@ -251,6 +252,7 @@ def simulate_exit_proceeds(total_proceeds: float, exit_date: date, cap_table_aft
 
     payouts_lp: Dict[str, float] = {}
     payouts_participation: Dict[str, float] = {}
+    lp_tranche_records: List[Dict[str, Any]] = []
 
     # Pre-compute accrued LP per tranche with simple non-cumulative interest
     for tr in tranches:
@@ -270,6 +272,13 @@ def simulate_exit_proceeds(total_proceeds: float, exit_date: date, cap_table_aft
             payouts_lp[tr["investor"]] = payouts_lp.get(tr["investor"], 0.0) + pay
             tr["received"] += pay
             proceeds_left -= pay
+            lp_tranche_records.append({
+                "investor": tr["investor"],
+                "round_name": tr["round_name"],
+                "class_name": tr["class_name"],
+                "lp_claim": tr["lp_claim"],
+                "lp_paid": pay
+            })
 
     # Phase 2: all remaining proceeds distributed pro-rata by shares (no caps in participation)
     if proceeds_left > 0:
@@ -298,7 +307,7 @@ def simulate_exit_proceeds(total_proceeds: float, exit_date: date, cap_table_aft
         if -1e-6 < proceeds_left < 0:
             proceeds_left = 0.0
 
-    # Build summaries by class
+    # Build summaries by class (kept for internal use)
     by_class: Dict[str, float] = {}
     class_of_investor = {tr["investor"]: tr["class_name"] for tr in tranches}
     for h, v in totals.items():
@@ -310,7 +319,8 @@ def simulate_exit_proceeds(total_proceeds: float, exit_date: date, cap_table_aft
         "payouts_participation": payouts_participation,
         "totals": totals,
         "by_class": by_class,
-        "unallocated": max(0.0, proceeds_left)
+        "unallocated": max(0.0, proceeds_left),
+        "lp_by_tranche": lp_tranche_records
     }
 
 
@@ -337,8 +347,9 @@ def money_fmt(x: float, currency: str = "€") -> str:
 def shares_fmt(x: float) -> str:
     if x != x:
         return "–"
-    # Show up to 4 decimals
-    return f"{x:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    
+    # Shares are integers
+    return f"{int(x):,}".replace(",", ".")  # DE-style formatting
 
 
 # ------------------------------
@@ -515,25 +526,57 @@ with st.expander("Proceeds bei Exit simulieren", expanded=False):
         final_cap = cap_tables[-1] if cap_tables else {}
         result = simulate_exit_proceeds(exit_amount, exit_date, final_cap, events, raw_data, liq_terms)
 
-        st.markdown("**Zusammenfassung nach Klasse**")
-        if result["by_class"]:
-            df_cls = pd.DataFrame([
-                {"Klasse": k, "Auszahlung (€)": v} for k, v in sorted(result["by_class"].items(), key=lambda kv: kv[1], reverse=True)
+        # Pie chart: ratio of LP proceeds vs pro-rata participation
+        lp_total = sum(result.get("payouts_lp", {}).values())
+        part_total = sum(result.get("payouts_participation", {}).values())
+        total_paid = lp_total + part_total
+        if total_paid > 0:
+            df_ratio = pd.DataFrame([
+                {"Komponente": "Liquidation Preference (LP)", "Betrag": lp_total},
+                {"Komponente": "Pro-rata Teilnahme", "Betrag": part_total},
             ])
-            df_cls["Auszahlung (€)"] = df_cls["Auszahlung (€)"].map(lambda x: money_fmt(x))
-            st.dataframe(df_cls, use_container_width=True)
+            df_ratio["Anteil %"] = df_ratio["Betrag"].map(lambda x: round(100 * x / total_paid, 2))
+            df_ratio["Betrag (fmt)"] = df_ratio["Betrag"].map(lambda x: money_fmt(x))
+            st.markdown("**Verhältnis LP vs. Pro-rata Anteil**")
+            pie = (
+                alt.Chart(df_ratio)
+                .mark_arc(outerRadius=120)
+                .encode(
+                    theta=alt.Theta(field="Betrag", type="quantitative"),
+                    color=alt.Color(field="Komponente", type="nominal"),
+                    tooltip=["Komponente", "Betrag (fmt)", "Anteil %"]
+                )
+                .properties(width=320, height=320)
+            )
+            _c1, _c2, _c3 = st.columns([1,2,1])
+            with _c2:
+                st.altair_chart(pie, use_container_width=True)
         else:
-            st.caption("Keine Auszahlungen.")
+            st.info("Keine Auszahlungen zur Visualisierung (LP & Pro-rata sind 0).")
 
-        st.markdown("**LP-Zahlungen (Vorzugsrechte)**")
-        if result["payouts_lp"]:
-            df_lp = pd.DataFrame([
-                {"Holder": k, "LP (€)": v} for k, v in sorted(result["payouts_lp"].items(), key=lambda kv: kv[1], reverse=True)
-            ])
-            df_lp["LP (€)"] = df_lp["LP (€)"].map(lambda x: money_fmt(x))
-            st.dataframe(df_lp, use_container_width=True)
+        st.markdown("**LP je Investor & Runde**")
+        if result.get("lp_by_tranche"):
+            # Build a DataFrame of LP paid per investor per round
+            df_tr = pd.DataFrame(result["lp_by_tranche"])  # columns: investor, round_name, class_name, lp_claim, lp_paid
+            # Ensure every investor-round combination exists (fill missing with 0)
+            pivot = df_tr.pivot_table(index="investor", columns="round_name", values="lp_paid", aggfunc="sum", fill_value=0.0)
+            pivot = pivot.reset_index().rename(columns={"investor": "Holder"})
+            # Compute Final column as sum across round columns
+            round_cols = [c for c in pivot.columns if c != "Holder"]
+            pivot["Final"] = pivot[round_cols].sum(axis=1)
+
+            # Order columns: rounds (by occurrence in data) then Final
+            ordered_rounds = [rn for rn in df_tr["round_name"].unique().tolist() if rn in round_cols]
+            pivot = pivot[["Holder"] + ordered_rounds + ["Final"]]
+
+            # Format money columns for display
+            display = pivot.copy()
+            for c in ordered_rounds + ["Final"]:
+                display[c] = display[c].map(lambda x: money_fmt(x))
+
+            st.dataframe(display, use_container_width=True)
         else:
-            st.caption("Keine LP-Zahlungen erfolgt.")
+            st.caption("Keine LP-Zuordnungen für Investoren und Runden vorhanden.")
 
         st.markdown("**Teilnahme pro-rata**")
         if result["payouts_participation"]:
