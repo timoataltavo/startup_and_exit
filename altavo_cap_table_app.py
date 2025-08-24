@@ -6,6 +6,9 @@ import io
 import pandas as pd
 import streamlit as st
 
+from datetime import datetime, date
+import math
+
 
 # ------------------------------
 # Data structures & utilities
@@ -166,6 +169,165 @@ def compute_valuations(events: List[RoundSummary], cap_tables: List[Dict[str, fl
     return out
 
 
+# ------------------------------
+# Liquidation Preference & Exit Simulation
+# ------------------------------
+
+def _parse_date(d: str) -> date:
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").date()
+    except Exception:
+        return date.today()
+
+
+def years_between(d0: str, d1: date) -> float:
+    if not d0:
+        return 0.0
+    return max(0.0, (d1 - _parse_date(d0)).days / 365.25)
+
+
+def extract_liquidation_terms(raw: Dict[str, Any]) -> Dict[str, Any]:
+    terms = (raw or {}).get("liquidation_terms", {})
+    classes = terms.get("classes", [])
+    # sort by processing_order (ascending) so lower is processed first (latest investors first)
+    classes_sorted = sorted(classes, key=lambda c: c.get("processing_order", 9999))
+    return {"classes": classes_sorted}
+
+
+def build_investment_tranches(events: List[RoundSummary], raw: Dict[str, Any], liq_terms: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build per-investor investment tranches with round date, principal and class metadata.
+    Only rounds whose names are mapped in liquidation_terms are considered preferred with LP. Others are treated as common (no LP).
+    """
+    name_to_class = {}
+    for c in liq_terms.get("classes", []):
+        for rn in c.get("applies_to_round_names", []):
+            name_to_class[rn] = c
+
+    tranches: List[Dict[str, Any]] = []
+    # use original raw events (pre-normalization) to access amounts_invested per round
+    raw_events = (raw or {}).get("events", [])
+    for ev_raw in raw_events:
+        if (ev_raw.get("kind") == "investment_round") and ev_raw.get("name") in name_to_class:
+            c = name_to_class[ev_raw.get("name")]
+            rdate = ev_raw.get("date")
+            for investor, amt in (ev_raw.get("amounts_invested") or {}).items():
+                tranches.append({
+                    "investor": investor.strip(),
+                    "round_name": ev_raw.get("name"),
+                    "date": rdate,
+                    "principal": _as_float(amt),
+                    "class_name": c.get("name"),
+                    "rate": float(c.get("simple_interest_rate")) if c.get("simple_interest_rate") is not None else 0.0,
+                    "cap_multiple_total": c.get("cap_multiple_total"),  # may be None
+                    "participating": bool(c.get("participating", True)),
+                    "received": 0.0
+                })
+    # sort tranches by class processing order
+    order_of_class = {c.get("name"): idx for idx, c in enumerate(liq_terms.get("classes", []))}
+    tranches.sort(key=lambda t: order_of_class.get(t["class_name"], 9999))
+    return tranches
+
+
+def simulate_exit_proceeds(total_proceeds: float, exit_date: date, cap_table_after: Dict[str, float],
+                           events: List[RoundSummary], raw_data: Dict[str, Any], liq_terms: Dict[str, Any]) -> Dict[str, Any]:
+    """
+     Participating preferred waterfall (updated logic):
+     1. Compute each preferred tranche's liquidation preference (LP) as principal plus simple interest.
+         If a cap_multiple_total is defined, it ONLY limits the LP amount itself (principal + interest), i.e. LP <= cap_multiple_total * principal.
+     2. Pay all LPs in class processing order until proceeds exhausted.
+     3. Distribute ALL remaining proceeds strictly pro-rata across all outstanding shares (no further caps; capped investors
+         participate without limitation beyond their LP cap).
+     This reflects a structure where a multiple limits only the preferential return, not the sum of LP + participation.
+    """
+    proceeds_left = max(0.0, float(total_proceeds))
+
+    # Build LP tranches
+    tranches = build_investment_tranches(events, raw_data, liq_terms)
+
+    # Map shares per holder for participation phase
+    shares_by_holder = {h: float(s) for h, s in cap_table_after.items()}
+    total_shares = sum(shares_by_holder.values()) or 1.0
+
+    payouts_lp: Dict[str, float] = {}
+    payouts_participation: Dict[str, float] = {}
+
+    # Pre-compute accrued LP per tranche with simple non-cumulative interest
+    for tr in tranches:
+        yrs = years_between(tr["date"], exit_date)
+        accrued = tr["principal"] * (1.0 + tr["rate"] * yrs)
+        cap_total = tr["cap_multiple_total"]
+        if cap_total is not None:
+            accrued = min(accrued, cap_total * tr["principal"])  # LP portion bounded by total cap
+        tr["lp_claim"] = max(0.0, accrued)
+
+    # Phase 1: pay LPs by class order
+    for tr in tranches:
+        if proceeds_left <= 0:
+            break
+        pay = min(tr["lp_claim"], proceeds_left)
+        if pay > 0:
+            payouts_lp[tr["investor"]] = payouts_lp.get(tr["investor"], 0.0) + pay
+            tr["received"] += pay
+            proceeds_left -= pay
+
+    # Phase 2: all remaining proceeds distributed pro-rata by shares (no caps in participation)
+    if proceeds_left > 0:
+        if total_shares > 0:
+            for h, s in shares_by_holder.items():
+                if s <= 0:
+                    continue
+                amt = proceeds_left * (s / total_shares)
+                if amt <= 0:
+                    continue
+                payouts_participation[h] = payouts_participation.get(h, 0.0) + amt
+            proceeds_left = 0.0
+
+    # Combine totals per holder
+    totals: Dict[str, float] = {}
+    for h, v in payouts_lp.items():
+        totals[h] = totals.get(h, 0.0) + v
+    for h, v in payouts_participation.items():
+        totals[h] = totals.get(h, 0.0) + v
+
+    # Numerical guardrails
+    if abs((sum(payouts_lp.values()) + sum(payouts_participation.values()) + proceeds_left) - float(total_proceeds)) < 1e-6:
+        pass  # OK
+    else:
+        # Clamp any tiny negative leftovers to zero
+        if -1e-6 < proceeds_left < 0:
+            proceeds_left = 0.0
+
+    # Build summaries by class
+    by_class: Dict[str, float] = {}
+    class_of_investor = {tr["investor"]: tr["class_name"] for tr in tranches}
+    for h, v in totals.items():
+        c = class_of_investor.get(h, "Common/Other")
+        by_class[c] = by_class.get(c, 0.0) + v
+
+    return {
+        "payouts_lp": payouts_lp,
+        "payouts_participation": payouts_participation,
+        "totals": totals,
+        "by_class": by_class,
+        "unallocated": max(0.0, proceeds_left)
+    }
+
+
+# ------------------------------
+# Helper: Compute total invested per holder
+# ------------------------------
+
+def compute_total_invested(raw: Dict[str, Any]) -> Dict[str, float]:
+    totals: Dict[str, float] = {}
+    for ev in (raw or {}).get("events", []):
+        if ev.get("kind") == "investment_round":
+            for investor, amt in (ev.get("amounts_invested") or {}).items():
+                k = investor.strip()
+                totals[k] = totals.get(k, 0.0) + _as_float(amt)
+    return totals
+
+
 def money_fmt(x: float, currency: str = "€") -> str:
     if x != x:  # NaN
         return "–"
@@ -218,7 +380,9 @@ if uploaded is None:
 # Parse file
 try:
     data = json.load(uploaded)
+    raw_data = data
     raw_events = data.get("events", [])
+    liq_terms = extract_liquidation_terms(data)
 except Exception as e:
     st.error(f"Fehler beim Lesen der Datei: {e}")
     st.stop()
@@ -335,6 +499,74 @@ with st.expander("⏱️ Eigentümerentwicklung über Zeit (vereinfacht)"):
                 fmt_subset = subset.copy()
                 fmt_subset["Wert (€)"] = fmt_subset["Wert (€)"].map(lambda x: money_fmt(x) if x == x else "–")
                 st.dataframe(fmt_subset[["Event #", "Event", "Holder", "Wert (€)"]])
+
+# ------------------------------
+# Exit Simulator UI
+# ------------------------------
+st.subheader("💸 Exit-Simulator")
+with st.expander("Proceeds bei Exit simulieren", expanded=False):
+    colx1, colx2 = st.columns([2,1])
+    with colx1:
+        exit_amount = st.number_input("Exit-Erlös (EUR)", min_value=0.0, value=10000000.0, step=100000.0, format="%f")
+    with colx2:
+        exit_date = st.date_input("Exit-Datum", value=date.today())
+
+    if st.button("Simulation starten", type="primary"):
+        final_cap = cap_tables[-1] if cap_tables else {}
+        result = simulate_exit_proceeds(exit_amount, exit_date, final_cap, events, raw_data, liq_terms)
+
+        st.markdown("**Zusammenfassung nach Klasse**")
+        if result["by_class"]:
+            df_cls = pd.DataFrame([
+                {"Klasse": k, "Auszahlung (€)": v} for k, v in sorted(result["by_class"].items(), key=lambda kv: kv[1], reverse=True)
+            ])
+            df_cls["Auszahlung (€)"] = df_cls["Auszahlung (€)"].map(lambda x: money_fmt(x))
+            st.dataframe(df_cls, use_container_width=True)
+        else:
+            st.caption("Keine Auszahlungen.")
+
+        st.markdown("**LP-Zahlungen (Vorzugsrechte)**")
+        if result["payouts_lp"]:
+            df_lp = pd.DataFrame([
+                {"Holder": k, "LP (€)": v} for k, v in sorted(result["payouts_lp"].items(), key=lambda kv: kv[1], reverse=True)
+            ])
+            df_lp["LP (€)"] = df_lp["LP (€)"].map(lambda x: money_fmt(x))
+            st.dataframe(df_lp, use_container_width=True)
+        else:
+            st.caption("Keine LP-Zahlungen erfolgt.")
+
+        st.markdown("**Teilnahme pro-rata**")
+        if result["payouts_participation"]:
+            df_part = pd.DataFrame([
+                {"Holder": k, "Teilnahme (€)": v} for k, v in sorted(result["payouts_participation"].items(), key=lambda kv: kv[1], reverse=True)
+            ])
+            df_part["Teilnahme (€)"] = df_part["Teilnahme (€)"].map(lambda x: money_fmt(x))
+            st.dataframe(df_part, use_container_width=True)
+
+        st.markdown("**Gesamt je Holder**")
+        if result["totals"]:
+            invested_by = compute_total_invested(raw_data)
+            rows = []
+            for holder, total_recv in sorted(result["totals"].items(), key=lambda kv: kv[1], reverse=True):
+                invested = invested_by.get(holder, 0.0)
+                multiple = (total_recv / invested) if invested > 0 else float("nan")
+                rows.append({
+                    "Holder": holder,
+                    "_Invested": invested,
+                    "_Total": total_recv,
+                    "_Multiple": multiple,
+                })
+            df_tot = pd.DataFrame(rows)
+            # Display-friendly columns
+            df_tot["Investiert (€)"] = df_tot["_Invested"].map(lambda x: money_fmt(x))
+            df_tot["Gesamt (€)"] = df_tot["_Total"].map(lambda x: money_fmt(x))
+            df_tot["Multiple (x)"] = df_tot["_Multiple"].map(lambda x: f"{x:.2f}x" if x == x else "–")
+            st.dataframe(df_tot[["Holder", "Investiert (€)", "Gesamt (€)", "Multiple (x)"]], use_container_width=True)
+
+        if result["unallocated"] > 1e-6:
+            st.warning(f"Nicht zugeordnet (Rest): {money_fmt(result['unallocated'])}")
+        else:
+            st.success("Gesamterlös vollständig verteilt.")
 
 st.divider()
 st.caption("Hinweis: Bewertungen werden aus Rundendaten hergeleitet (impliziter Anteilspreis = neues Kapital / neue Anteile). Pre-Money basiert auf ausstehenden Anteilen * Anteilspreis vor Ausgabe. Bei VSP-Events gibt es keine neue Bewertung.")
