@@ -186,6 +186,31 @@ with st.form("new_round_form"):
     price_per_share_preview = (pre_money_val / total_shares_before) if total_shares_before > 0 else float("nan")
     st.write("Preis je Anteil (Vorschau): ", money_fmt(price_per_share_preview) if price_per_share_preview == price_per_share_preview else "–")
 
+    # --- Optional Over-Pro-Rata Discount Settings ---
+    st.markdown("**Optional: Über‑Pro‑Rata Rabatt**")
+    min_round_size_eur = st.number_input(
+        "Minimaler Rundengrößen-Schwellenwert (EUR)",
+        min_value=0.0,
+        value=0.0,
+        step=100000.0,
+        format="%f",
+        help=(
+            "Dient zur Berechnung der Pro‑Rata‑Ansprüche der bestehenden Anteilseigner. "
+            "Investitionen über diese Pro‑Rata‑Anteile hinaus gelten als über‑Pro‑Rata."
+        ),
+    )
+    discount_percent = st.number_input(
+        "Rabatt auf über‑Pro‑Rata‑Anteile (%)",
+        min_value=0.0,
+        max_value=50.0,
+        value=0.0,
+        step=0.5,
+        format="%f",
+        help=(
+            "Prozentsatz, um den der Anteilspreis für über‑Pro‑Rata‑Anteile reduziert wird (z. B. 10%)."
+        ),
+    )
+
     st.markdown("**Investoren & Beträge** (Zeilen anpassen / neue Zeilen hinzufügen)")
     init_rows = pd.DataFrame({
         "Investor": prev_investors if prev_investors else [""],
@@ -247,8 +272,53 @@ if new_money <= 0:
     st.error("Bitte mindestens einen positiven Investitionsbetrag eingeben.")
     st.stop()
 
+# Eligible holders for pro‑rata (alle Real‑Shareholder, exkl. VSP‑Pool und reine VSP‑Empfänger)
+eligible_shares_before: Dict[str, float] = {}
+for holder, sh in (cap_tables[-1].items() if cap_tables else []):
+    pass
+if cap_tables:
+    for holder, sh in cap_tables[-1].items():
+        if holder == vsp_pool_name:
+            continue
+        if holder in vsp_only_holders_hist:
+            continue
+        if sh > 0:
+            eligible_shares_before[holder] = float(sh)
+eligible_total_shares_before = sum(eligible_shares_before.values())
+
+# --- Pro‑Rata & Über‑Pro‑Rata Berechnung ---
+min_round_size = float(min_round_size_eur) if 'min_round_size_eur' in locals() else 0.0
+discount_pct = max(0.0, min(float(discount_percent if 'discount_percent' in locals() else 0.0), 50.0)) / 100.0
+
+pro_rata_eur: Dict[str, float] = {}
+if min_round_size > 0.0 and eligible_total_shares_before > 0.0:
+    for holder, sh in eligible_shares_before.items():
+        pro_rata_eur[holder] = min_round_size * (sh / eligible_total_shares_before)
+
+invest_normal_eur: Dict[str, float] = {}
+invest_over_eur: Dict[str, float] = {}
+for inv, amt in amounts_invested.items():
+    entitlement = pro_rata_eur.get(inv, 0.0)
+    normal_part = min(amt, entitlement)
+    over_part = max(0.0, amt - normal_part)
+    invest_normal_eur[inv] = normal_part
+    invest_over_eur[inv] = over_part
+
 pps = pre_money_val / total_shares_before
-shares_received = {inv: float(math.ceil(amt / pps)) for inv, amt in amounts_invested.items()}
+pps_discounted = pps * (1.0 - discount_pct) if discount_pct > 0.0 else pps
+
+shares_received: Dict[str, float] = {}
+effective_price_per_investor: Dict[str, float] = {}
+for inv, amt in amounts_invested.items():
+    normal_eur = invest_normal_eur.get(inv, 0.0)
+    over_eur = invest_over_eur.get(inv, 0.0)
+    if discount_pct <= 0.0 or min_round_size <= 0.0:
+        shares = (normal_eur + over_eur) / pps
+    else:
+        shares = (normal_eur / pps) + (over_eur / pps_discounted if pps_discounted > 0 else 0.0)
+    shares_received[inv] = float(math.ceil(shares))
+    paid = normal_eur + over_eur
+    effective_price_per_investor[inv] = (paid / shares_received[inv]) if shares_received[inv] > 0 else float('nan')
 
 # Optional: pro-rata TRANSFER to VSP Pool to reach target percent (post-round)
 t = float(vsp_target_percent) / 100.0 if 'vsp_target_percent' in locals() else 0.0
@@ -286,6 +356,11 @@ new_event = {
     "amounts_invested": amounts_invested,
     "shares_received": shares_received,
     "shares_to_vsp": shares_to_vsp if t > 0 else {},
+    "discount": {
+        "min_round_eur": float(min_round_size),
+        "discount_percent": float(discount_pct * 100.0),
+        "investor_over_pro_rata_eur": invest_over_eur,
+    },
 }
 
 # Deep copy and append
@@ -320,12 +395,20 @@ else:
 # --------------------------
 st.subheader("Vorschau: neue Anteile pro Investor")
 prev = pd.DataFrame([
-    {"Investor": k, "Investiert (€)": v, "Neue Anteile": shares_received[k]}
+    {
+        "Investor": k,
+        "Investiert (€)": v,
+        "Davon über Pro‑Rata (€)": invest_over_eur.get(k, 0.0),
+        "Neue Anteile": shares_received[k],
+        "Effektiver Preis/Anteil": effective_price_per_investor.get(k, float('nan')),
+    }
     for k, v in amounts_invested.items()
 ])
 if not prev.empty:
     prev["Investiert (€)"] = prev["Investiert (€)"].map(lambda x: money_fmt(x))
+    prev["Davon über Pro‑Rata (€)"] = prev["Davon über Pro‑Rata (€)"].map(lambda x: money_fmt(x))
     prev["Neue Anteile"] = prev["Neue Anteile"].map(lambda x: shares_fmt(x))
+    prev["Effektiver Preis/Anteil"] = prev["Effektiver Preis/Anteil"].map(lambda x: money_fmt(x) if x == x else "–")
 
 # Preview pro-rata transfers to VSP Pool
 if shares_to_vsp:
@@ -366,4 +449,5 @@ st.caption(
     "Hinweis: Preis je Anteil = Pre-Money / ausstehende Anteile vor Runde. Neue Anteile = Investition / Preis je Anteil. "
     "Falls eine Zielgröße für den VSP-Pool angegeben ist, werden Anteile **pro-rata** von allen Nicht-Pool-Inhabern an den VSP-Pool übertragen, "
     "so dass der Ziel-Prozentsatz *nach* der Runde erreicht wird (keine neuen Anteile, rein umverteilend)."
+    " Zusätzliche Funktion: Für Investitionen über die pro‑rata Zuteilung (bezogen auf die minimale Rundengröße) wird ein konfigurierbarer Rabatt auf den Anteilspreis angewandt."
 )
