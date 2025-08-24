@@ -447,9 +447,14 @@ for v in valuations:
         last_price = p
     price_history.append(last_price)
 
-# Sidebar selection
+# Haupt-Event Auswahl (aus Sidebar in Main Area verschoben)
 event_labels = [f"{ev.date or '—'} — {ev.name}" for ev in events]
-idx = st.sidebar.selectbox("Event auswählen", options=list(range(len(events))), format_func=lambda i: event_labels[i])
+idx = st.selectbox(
+    "Event auswählen",
+    options=list(range(len(events))),
+    format_func=lambda i: event_labels[i],
+    key="event_select_main",
+)
 
 selected_event = events[idx]
 cap_after = cap_tables[idx]
@@ -506,44 +511,80 @@ else:
 
 # Ownership over time (optional view)
 with st.expander("⏱️ Eigentümerentwicklung über Zeit (vereinfacht)"):
-    # Build owner list
+    # Konfiguration für Achsen-Beschriftungen
+    MAX_LABEL_CHARS = 28  # feste maximale Länge für Eventnamen auf der X-Achse
+    def _short(label: str) -> str:
+        return label if len(label) <= MAX_LABEL_CHARS else label[: MAX_LABEL_CHARS - 1] + "…"
+
     owners = sorted({h for table in cap_tables for h in table.keys()})
-    records = []
     view_mode = st.radio("Einheit", ["%", "€"], horizontal=True)
+
+    # Long-format Datensätze aufbauen inkl. gekürzter Event Labels
+    long_rows = []
+    short_labels_order: List[str] = []
     for i, table in enumerate(cap_tables):
+        full_label = f"{events[i].date or '—'} — {events[i].name}"
+        short_label = _short(full_label)
+        short_labels_order.append(short_label)
         total = sum(table.values()) or 1.0
         price_i = price_history[i]
-        for o in owners:
-            shares_o = table.get(o, 0.0)
-            pct = (shares_o / total) * 100.0
-            value = shares_o * price_i if price_i == price_i else float('nan')
-            records.append({
-                "Event #": i + 1,
-                "Event": f"{events[i].date or '—'} — {events[i].name}",
-                "Holder": o,
+        for holder in owners:
+            sh = table.get(holder, 0.0)
+            pct = (sh / total) * 100.0
+            value = sh * price_i if price_i == price_i else float('nan')
+            long_rows.append({
+                "EventIndex": i + 1,
+                "EventFull": full_label,
+                "EventShort": short_label,
+                "Holder": holder,
                 "Ownership %": round(pct, 4),
                 "Wert (€)": value,
             })
-    df_over_time = pd.DataFrame(records)
-    chosen = st.multiselect("Akteure auswählen", owners, default=[o for o in owners if "VSP" not in o][:5])
+    df_long = pd.DataFrame(long_rows)
+
+    chosen = st.multiselect(
+        "Akteure auswählen",
+        owners,
+        default=[o for o in owners if "VSP" not in o][:5],
+    )
     if chosen:
-        subset = df_over_time[df_over_time["Holder"].isin(chosen)]
+        plot_df = df_long[df_long["Holder"].isin(chosen)].copy()
         if view_mode == "%":
-            pivot = subset.pivot(index="Event #", columns="Holder", values="Ownership %").fillna(0.0)
-            st.line_chart(pivot)
+            y_field = "Ownership %"
+            y_title = "Ownership %"
         else:
+            y_field = "Wert (€)"
+            y_title = "Wert (€)"
             if all((p != p) for p in price_history):
                 st.info("Noch keine Bewertung verfügbar für die ausgewählten Events.")
-            pivot_val = subset.pivot(index="Event #", columns="Holder", values="Wert (€)")
-            st.line_chart(pivot_val)
+
+        # Altair Liniendiagramm mit benutzerdefinierten X-Ticks (gekürzte Eventnamen)
+        domain_order = short_labels_order  # Reihenfolge der Ereignisse beibehalten
+        chart = (
+            alt.Chart(plot_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X(
+                    "EventShort:N",
+                    sort=domain_order,
+                    title="Event",
+                    axis=alt.Axis(labelOverlap=True, labelLimit=140, labelAngle=-25),
+                ),
+                y=alt.Y(f"{y_field}:Q", title=y_title),
+                color=alt.Color("Holder:N", title="Holder"),
+                tooltip=["EventFull", "Holder", alt.Tooltip(f"{y_field}:Q", format=".2f")],
+            )
+            .properties(height=380)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
         show_table = st.checkbox("Tabellarische Daten anzeigen")
         if show_table:
-            if view_mode == "%":
-                st.dataframe(subset[["Event #", "Event", "Holder", "Ownership %"]])
-            else:
-                fmt_subset = subset.copy()
-                fmt_subset["Wert (€)"] = fmt_subset["Wert (€)"].map(lambda x: money_fmt(x) if x == x else "–")
-                st.dataframe(fmt_subset[["Event #", "Event", "Holder", "Wert (€)"]])
+            show_cols = ["EventIndex", "EventFull", "EventShort", "Holder", y_field]
+            table_df = plot_df[show_cols].copy()
+            if y_field == "Wert (€)":
+                table_df[y_field] = table_df[y_field].map(lambda x: money_fmt(x) if x == x else "–")
+            st.dataframe(table_df, use_container_width=True)
 
 # ------------------------------
 # Exit Simulator UI
