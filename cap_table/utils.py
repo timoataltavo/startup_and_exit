@@ -17,10 +17,16 @@ def _parse_date(d: str) -> date:
         return date.today()
 
 
-def years_between(d0: str, d1: date) -> float:
+def years_between(d0: str|date, d1: date|str) -> float:
     if not d0:
         return 0.0
-    return max(0.0, (d1 - _parse_date(d0)).days / 365.25)
+
+    if isinstance(d0, str):
+        d0 = _parse_date(d0)
+    if isinstance(d1, str):
+        d1 = _parse_date(d1)
+
+    return max(0.0, (d1 - d0).days / 365.25)
 
 
 def money_fmt(x: float, currency: str = "€") -> str:

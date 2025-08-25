@@ -30,12 +30,13 @@ from pages import (
     page_cap_table_explorer as page_cap_table_explorer_page,
     page_round_designer as page_round_designer_page,
     page_exit_simulator as page_exit_simulator_page,
+    page_json_editor as page_json_editor_page,
 )
 
 st.set_page_config(page_title="Cap Table Toolkit (GmbH)", page_icon="🧮", layout="wide")
 
 # Sidebar navigation
-PAGES = ["Cap Table Explorer", "Round Designer", "Exit Simulator"]
+PAGES = ["Cap Table Explorer", "Round Designer", "Exit Simulator", "JSON Editor"]
 page = st.sidebar.radio("Seite wählen", PAGES)
 
 # Shared: file upload (all pages use underlying data). Persist in session_state.
@@ -84,6 +85,8 @@ def page_round_designer():
 
 def page_exit_simulator():
     page_exit_simulator_page.render(events, cap_tables, raw_data, liq_terms)
+def page_json_editor():
+    page_json_editor_page.render(raw_data)
 
 if page == "Cap Table Explorer":
     page_cap_table_explorer()
@@ -91,5 +94,7 @@ elif page == "Round Designer":
     page_round_designer()
 elif page == "Exit Simulator":
     page_exit_simulator()
+elif page == "JSON Editor":
+    page_json_editor()
 
 st.caption("Hinweis: Bewertungen = neues Kapital / neue Anteile jeder Runde; Pre-Money = vorherige ausstehende Anteile * Anteilspreis.")

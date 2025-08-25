@@ -30,90 +30,107 @@ def extract_liquidation_terms(raw: Dict[str, Any]) -> Dict[str, Any]:
     return {"classes": classes_sorted}
 
 
-def build_investment_tranches(_events: List[RoundSummary], raw: Dict[str, Any], liq_terms: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_lp_rounds(raw: Dict[str, Any], liq_terms: Dict[str, Any]) -> List[Dict[str, Any]]:
     name_to_class = {}
     for c in liq_terms.get("classes", []):
         for rn in c.get("applies_to_round_names", []):
             name_to_class[rn] = c
-    tranches: List[Dict[str, Any]] = []
+    lp_rounds = []
     raw_events = (raw or {}).get("events", [])
     for ev_raw in raw_events:
         if (ev_raw.get("kind") == "investment_round") and ev_raw.get("name") in name_to_class:
             c = name_to_class[ev_raw.get("name")]; rdate = ev_raw.get("date")
-            for investor, amt in (ev_raw.get("amounts_invested") or {}).items():
-                tranches.append({
-                    "investor": investor.strip(),
-                    "round_name": ev_raw.get("name"),
+            
+            lp_round = {
+                    "name": ev_raw.get("name"),
                     "date": rdate,
-                    "principal": _as_float(amt),
-                    "class_name": c.get("name"),
                     "rate": float(c.get("simple_interest_rate")) if c.get("simple_interest_rate") is not None else 0.0,
                     "cap_multiple_total": c.get("cap_multiple_total"),
-                    "received": 0.0,
+                    "tranches": []                 
+            }
+            
+            total_invested = 0.0
+            for investor, amt in (ev_raw.get("amounts_invested") or {}).items():
+                lp_round["tranches"].append({
+                    "investor": investor.strip(),
+                    "principal": _as_float(amt),
+                    "received": 0.0
                 })
-    order_of_class = {c.get("name"): idx for idx, c in enumerate(liq_terms.get("classes", []))}
-    tranches.sort(key=lambda t: order_of_class.get(t["class_name"], 9999))
-    return tranches
+                total_invested += _as_float(amt)
+                
+            lp_round["total_invested"] = total_invested
+            
+            lp_rounds.append(lp_round)
+
+    # Sort by date, later first
+    lp_rounds.sort(key=lambda t: t["date"], reverse=True)
+
+    return lp_rounds
 
 
-def simulate_exit_proceeds(total_proceeds: float, exit_date: date, cap_table_after: Dict[str, float], events: List[RoundSummary], raw_data: Dict[str, Any], liq_terms: Dict[str, Any]) -> Dict[str, Any]:
+def simulate_exit_proceeds(total_proceeds: float, exit_date: date, cap_table_after: Dict[str, float], raw_data: Dict[str, Any], liq_terms: Dict[str, Any]) -> Dict[str, Any]:
     proceeds_left = max(0.0, float(total_proceeds))
-    tranches = build_investment_tranches(events, raw_data, liq_terms)
+    lp_rounds = build_lp_rounds(raw_data, liq_terms)
     shares_by_holder = {h: float(s) for h, s in cap_table_after.items()}
+    totals_by_holder = compute_total_invested(raw_data)
     total_shares = sum(shares_by_holder.values()) or 1.0
-    payouts_lp: Dict[str, float] = {}
+    
+    payouts_lp: Dict[str, dict] = {}
     payouts_participation: Dict[str, float] = {}
-    lp_tranche_records: List[Dict[str, Any]] = []
-    for tr in tranches:
-        yrs = years_between(tr["date"], exit_date)
-        accrued = tr["principal"] * (1.0 + tr["rate"] * yrs)
-        cap_total = tr["cap_multiple_total"]
-        if cap_total is not None:
-            accrued = min(accrued, cap_total * tr["principal"])
-        tr["lp_claim"] = max(0.0, accrued)
-    for tr in tranches:
-        if proceeds_left <= 0:
-            break
-        pay = min(tr["lp_claim"], proceeds_left)
-        if pay > 0:
-            payouts_lp[tr["investor"]] = payouts_lp.get(tr["investor"], 0.0) + pay
-            tr["received"] += pay
-            proceeds_left -= pay
-            lp_tranche_records.append({
-                "investor": tr["investor"],
-                "round_name": tr["round_name"],
-                "class_name": tr["class_name"],
-                "lp_claim": tr["lp_claim"],
-                "lp_paid": pay,
-            })
-    if proceeds_left > 0 and total_shares > 0:
-        for h, s in shares_by_holder.items():
-            if s <= 0:
-                continue
-            amt = proceeds_left * (s / total_shares)
-            if amt <= 0:
-                continue
-            payouts_participation[h] = payouts_participation.get(h, 0.0) + amt
-        proceeds_left = 0.0
+
+    # First LPs are satisfied before any participation
+
+    for lp_round in lp_rounds:
+        # Compute the LP interest of the complete round
+        yrs = years_between(lp_round["date"], exit_date)
+        accrued = lp_round["total_invested"] * (1.0 + lp_round["rate"] * yrs)
+
+        # Max at the proceeds left in the round
+        accrued = min(accrued, proceeds_left)
+
+        # Split the accrued pro-rata invested in this round
+        for tr in lp_round["tranches"]:
+            investor_lp_claim = tr["principal"] / lp_round["total_invested"] * accrued if lp_round["total_invested"] > 0 else 0
+
+            # Check if the claim is not capped
+            if lp_round["cap_multiple_total"] is not None:
+                total_invest = totals_by_holder.get(tr["investor"], 0.0)
+                pro_rata_proceeds = (shares_by_holder[tr["investor"]] / total_shares) * total_proceeds
+                if pro_rata_proceeds > total_invest * lp_round["cap_multiple_total"]:
+                    investor_lp_claim = 0.0  # void the LP claim
+
+            # Payout
+            tr["payout"] = max(0.0, investor_lp_claim)
+            proceeds_left -= tr["payout"]
+
+            # Add to payouts for that investor
+            investor_lp_dict = payouts_lp.get(tr["investor"], {})
+            investor_lp_dict[lp_round["name"]] = tr["payout"]
+            payouts_lp[tr["investor"]] = investor_lp_dict
+
+    # Now handle participation payouts
+    for holder, shares in shares_by_holder.items():
+        if shares <= 0:
+            continue
+        amt = proceeds_left * (shares / total_shares)
+        if amt <= 0:
+            continue
+        payouts_participation[holder] = payouts_participation.get(holder, 0.0) + amt
+    proceeds_left = 0.0
     totals: Dict[str, float] = {}
+
     for h, v in payouts_lp.items():
-        totals[h] = totals.get(h, 0.0) + v
+        totals[h] = totals.get(h, 0.0) + sum(v.values())
     for h, v in payouts_participation.items():
         totals[h] = totals.get(h, 0.0) + v
     if -1e-6 < proceeds_left < 0:
         proceeds_left = 0.0
-    by_class: Dict[str, float] = {}
-    class_of_investor = {tr["investor"]: tr["class_name"] for tr in tranches}
-    for h, v in totals.items():
-        c = class_of_investor.get(h, "Common/Other")
-        by_class[c] = by_class.get(c, 0.0) + v
+
     return {
         "payouts_lp": payouts_lp,
         "payouts_participation": payouts_participation,
         "totals": totals,
-        "by_class": by_class,
-        "unallocated": max(0.0, proceeds_left),
-        "lp_by_tranche": lp_tranche_records,
+        "unallocated": max(0.0, proceeds_left)
     }
 
 

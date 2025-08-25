@@ -23,29 +23,14 @@ from __future__ import annotations
 
 import math
 from datetime import date
-from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Load only the pure logic section of the app (stop before Streamlit UI)
-# ---------------------------------------------------------------------------
-SRC_PATH = Path(__file__).parent / "altavo_cap_table_app.py"
-source_lines = []
-for line in SRC_PATH.read_text(encoding="utf-8").splitlines(True):
-    # Break right before the first Streamlit config line
-    if line.strip().startswith("st.set_page_config"):
-        break
-    source_lines.append(line)
-logic_code = "".join(source_lines)
-ns: dict[str, object] = {}
-exec(logic_code, ns)  # noqa: S102 (intentional dynamic exec for test isolation)
-
-# Extract needed symbols
-normalize_event = ns["normalize_event"]
-compute_cumulative_states = ns["compute_cumulative_states"]
-compute_valuations = ns["compute_valuations"]
-years_between = ns["years_between"]
-simulate_exit_proceeds = ns["simulate_exit_proceeds"]
-_as_float = ns["_as_float"]  # just in case
+from cap_table import (
+    normalize_event,
+    compute_cumulative_states,
+    compute_valuations,
+    years_between,
+    simulate_exit_proceeds,
+    extract_liquidation_terms
+)
 
 
 # Helper to build normalized events easily
@@ -158,7 +143,7 @@ def test_years_between():
 
 def test_exit_waterfall_participating():
     events, cap_tables, _ = _prepare()
-    liq_terms = ns["extract_liquidation_terms"](RAW_DATA)
+    liq_terms = extract_liquidation_terms(RAW_DATA)
     final_cap = cap_tables[-1]
     total_exit = 3_300_000.0
     result = simulate_exit_proceeds(total_exit, date(2025, 1, 1), final_cap, events, RAW_DATA, liq_terms)
@@ -200,65 +185,85 @@ def test_exit_waterfall_participating():
     assert "Common/Other" in by_class
 
 
-def test_exit_waterfall_capped_preference():
-    """Updated logic: cap limits ONLY LP (principal+interest), not total payout.
+def test_exit_waterfall_capped_preference_voids_lp_when_threshold_exceeded():
+    """New capped LP semantics: LP void if pro-rata share >= principal * cap_multiple.
 
     Scenario:
-    - Founder: 90,000 common shares (no LP).
-    - Cap Round: InvestorCap invests 100k for 10,000 shares (price 10).
-      Cap multiple 2.0 -> LP (principal + interest) capped at 200k (interest 0 so LP = 100k < 200k).
-    - Exit: 5,000,000.
-
-    Distribution:
-      LP: 100,000 to InvestorCap.
-      Remaining 4,900,000 shared over 100,000 shares => 49.0 per share.
-      Founder: 90,000 * 49 = 4,410,000
-      InvestorCap participation: 10,000 * 49 = 490,000
-      Total InvestorCap = 590,000 (exceeds 2x principal because cap doesn't limit participation phase).
+    - Founder: 90,000 common
+    - Cap Round: InvestorCap 100k for 10,000 shares (10%). cap multiple 2x => threshold 200k.
+    - Exit: 5,000,000 => pro-rata for investor = 500k (> 200k) so LP is void (gets only participation).
     """
     raw = {
         "events": [
             {"kind": "investment_round", "name": "Founding2", "date": "2023-01-01", "shares_received": {"Founder": 90_000}},
             {"kind": "investment_round", "name": "Cap Round", "date": "2023-06-01", "amounts_invested": {"InvestorCap": 100_000}, "shares_received": {"InvestorCap": 10_000}},
         ],
-        "liquidation_terms": {
-            "classes": [
-                {
-                    "name": "Cap Preferred",
-                    "applies_to_round_names": ["Cap Round"],
-                    "processing_order": 1,
-                    "simple_interest_rate": 0.0,
-                    "participating": True,
-                    "cap_multiple_total": 2.0,
-                }
-            ]
-        },
+        "liquidation_terms": {"classes": [{"name": "Cap Preferred", "applies_to_round_names": ["Cap Round"], "simple_interest_rate": 0.0,"cap_multiple_total": 2.0}]},
     }
     events = [normalize_event(e) for e in raw["events"]]
     events_sorted = sorted(events, key=lambda e: e.date or "")
     events_norm, cap_tables = compute_cumulative_states(events_sorted)
-    liq_terms = ns["extract_liquidation_terms"](raw)
+    liq_terms = extract_liquidation_terms(raw)
     final_cap = cap_tables[-1]
     total_exit = 5_000_000.0
     result = simulate_exit_proceeds(total_exit, date(2025, 1, 1), final_cap, events_norm, raw, liq_terms)
 
     payouts = result["totals"]
-    # Integrity check
     distributed = sum(payouts.values()) + result.get("unallocated", 0.0)
     assert abs(distributed - total_exit) < 1e-4
+    # LP voided
+    assert result["payouts_lp"].get("InvestorCap", 0.0) == 0.0
+    # All proceeds distributed pro-rata: per share = 5,000,000 / 100,000 = 50
+    per_share = 5_000_000 / 100_000
+    assert math.isclose(per_share, 50.0, rel_tol=1e-6)
+    assert math.isclose(result["payouts_participation"].get("InvestorCap", 0.0), 10_000 * 50.0, rel_tol=1e-6)
+    assert math.isclose(payouts.get("Founder", 0.0), 90_000 * 50.0, rel_tol=1e-6)
 
-    # LP remains 100k (within cap)
-    lp_paid = result["payouts_lp"].get("InvestorCap", 0.0)
-    assert math.isclose(lp_paid, 100_000.0, rel_tol=1e-6)
-    # Participation per-share = 4.9M / 100k = 49
-    per_share = 4_900_000.0 / 100_000.0
-    assert math.isclose(per_share, 49.0, rel_tol=1e-6)
-    part_paid = result["payouts_participation"].get("InvestorCap", 0.0)
-    assert math.isclose(part_paid, 10_000 * 49.0, rel_tol=1e-6)
-    # Total investor amount (uncapped participation)
-    assert math.isclose(payouts.get("InvestorCap", 0.0), 100_000 + 490_000, rel_tol=1e-6)
-    # Founder participation
-    assert math.isclose(payouts.get("Founder", 0.0), 90_000 * 49.0, rel_tol=1e-6)
+
+def test_exit_waterfall_capped_preference_lp_applies_below_threshold():
+    """When pro-rata share < threshold, LP applies then participation on remainder."""
+    raw = {
+        "events": [
+            {"kind": "investment_round", "name": "Founding2", "date": "2023-01-01", "shares_received": {"Founder": 90_000}},
+            {"kind": "investment_round", "name": "Cap Round", "date": "2024-01-01", "amounts_invested": {"InvestorCap": 100_000}, "shares_received": {"InvestorCap": 10_000}},
+        ],
+        "liquidation_terms": {"classes": [{"name": "Cap Preferred", "applies_to_round_names": ["Cap Round"], "simple_interest_rate": 1.0, "cap_multiple_total": 2.0}]},
+    }
+    events = [normalize_event(e) for e in raw["events"]]
+    events_sorted = sorted(events, key=lambda e: e.date or "")
+    events_norm, cap_tables = compute_cumulative_states(events_sorted)
+    liq_terms = extract_liquidation_terms(raw)
+    final_cap = cap_tables[-1]
+    total_exit = 250_000.0  # pro-rata (10%) = 25k < threshold 200k => LP effective
+    result = simulate_exit_proceeds(total_exit, date(2025, 1, 1), final_cap, events_norm, raw, liq_terms)
+    # LP pays 100k first, remainder 150k shared => per share 1.5
+    assert math.isclose(result["payouts_lp"].get("InvestorCap", 0.0), years_between("2024-01-01", date(2025, 1, 1)) * 100_000 + 100_000, rel_tol=1e-6)
+
+    per_share = (total_exit - result["payouts_lp"].get("InvestorCap", 0.0)) / 100_000
+    assert math.isclose(result["payouts_participation"].get("InvestorCap", 0.0), 10_000 * per_share, rel_tol=1e-6)
+    assert math.isclose(result["totals"].get("Founder", 0.0), 90_000 * per_share, rel_tol=1e-6)
+    assert math.isclose(result["totals"].get("InvestorCap", 0.0), result["payouts_lp"].get("InvestorCap", 0.0) + result["payouts_participation"].get("InvestorCap", 0.0), rel_tol=1e-6)
+
+
+def test_exit_waterfall_capped_and_not_capped_lp():
+    """When both capped and non-capped LPs are present, the correct LP is applied."""
+    raw = {
+        "events": [
+            {"kind": "investment_round", "name": "Founding2", "date": "2023-01-01", "shares_received": {"Founder": 90_000}},
+            {"kind": "investment_round", "name": "Non-Capped Round", "date": "2024-01-01", "amounts_invested": {"InvestorCap": 100_000}, "shares_received": {"InvestorCap": 10_000}},
+            {"kind": "investment_round", "name": "Cap Round", "date": "2025-01-01", "amounts_invested": {"InvestorCap": 100_000}, "shares_received": {"InvestorCap": 10_000}},
+        ],
+        "liquidation_terms": {"classes": [{"name": "Cap Preferred", "applies_to_round_names": ["Cap Round"], "simple_interest_rate": .05, "cap_multiple_total": 2.0}, {"name": "Non-Cap", "applies_to_round_names": ["Non-Capped Round"], "simple_interest_rate": .005, "cap_multiple_total": 1.0}]}
+    }
+    
+    events = [normalize_event(e) for e in raw["events"]]
+    events_sorted = sorted(events, key=lambda e: e.date or "")
+    events_norm, cap_tables = compute_cumulative_states(events_sorted)
+    liq_terms = extract_liquidation_terms(raw)
+    final_cap = cap_tables[-1]
+    total_exit = 250_000.0  # pro-rata (10%) = 25k < threshold 200k => LP effective
+    result = simulate_exit_proceeds(total_exit, date(2025, 1, 1), final_cap, events_norm, raw, liq_terms)
+    
 
 
 if __name__ == "__main__":  # pragma: no cover
