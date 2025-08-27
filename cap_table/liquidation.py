@@ -96,7 +96,7 @@ def simulate_exit_proceeds(total_proceeds: float, exit_date: date, cap_table_aft
             if lp_round["cap_multiple_total"] is not None:
                 total_invest = totals_by_holder.get(tr["investor"], 0.0)
                 pro_rata_proceeds = (shares_by_holder[tr["investor"]] / total_shares) * total_proceeds
-                if pro_rata_proceeds > total_invest * lp_round["cap_multiple_total"]:
+                if pro_rata_proceeds >= total_invest * lp_round["cap_multiple_total"] + total_invest * lp_round["rate"] * yrs:
                     investor_lp_claim = 0.0  # void the LP claim
 
             # Payout
