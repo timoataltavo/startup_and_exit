@@ -26,7 +26,7 @@ __all__ = [
 ]
 
 # Page modules (aliased to avoid name collision with wrapper functions)
-from pages import (
+from views import (
     page_cap_table_explorer as page_cap_table_explorer_page,
     page_round_designer as page_round_designer_page,
     page_exit_simulator as page_exit_simulator_page,
