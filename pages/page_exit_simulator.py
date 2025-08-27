@@ -7,7 +7,54 @@ import streamlit as st
 from cap_table import RoundSummary, simulate_exit_proceeds, money_fmt, compute_total_invested
 
 
-def render(events: List[RoundSummary], cap_tables: List[Dict[str, float]], raw_data: Dict[str, Any], liq_terms: Dict[str, Any]):
+@st.cache_data(show_spinner=False)
+def _holder_proceeds_sensitivity(
+    exit_center: float,
+    width: float,
+    steps: int,
+    holders: list[str],
+    exit_date: date,
+    final_cap: Dict[str, float],
+    raw_data: Dict[str, Any],
+    liq_terms: Dict[str, Any],
+):
+    """Compute proceeds per holder across a range of exit amounts.
+
+    Returns DataFrame columns:
+      Exit (€), Holder, Proceeds (€), Anteil Gesamt %, Multiple (x)
+    """
+    exit_center = float(exit_center)
+    width = max(0.0, float(width))
+    steps = max(2, int(steps))
+    lo = max(0.0, exit_center - width)
+    hi = exit_center + width
+    if hi <= lo:
+        hi = lo + 1.0
+    delta = (hi - lo) / (steps - 1)
+    invested_by = compute_total_invested(raw_data)
+    records: list[dict[str, Any]] = []
+    for i in range(steps):
+        exit_amt = lo + i * delta
+        sim = simulate_exit_proceeds(exit_amt, exit_date, final_cap, raw_data, liq_terms)
+        totals = sim.get("totals", {}) or {}
+        for h in holders:
+            proceeds = totals.get(h, 0.0)
+            pct_total = (proceeds / exit_amt * 100.0) if exit_amt > 0 else float("nan")
+            invested = invested_by.get(h, 0.0)
+            multiple = (proceeds / invested) if invested > 0 else float("nan")
+            records.append(
+                {
+                    "Exit (€)": exit_amt,
+                    "Holder": h,
+                    "Proceeds (€)": proceeds,
+                    "Anteil Gesamt %": pct_total,
+                    "Multiple (x)": multiple,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def render(_events: List[RoundSummary], cap_tables: List[Dict[str, float]], raw_data: Dict[str, Any], liq_terms: Dict[str, Any]):
     st.title("💸 Exit Simulator")
     st.markdown("Liquidation Preference & Participating Preferred Waterfall Simulation.")
     colx1, colx2 = st.columns([2,1])
@@ -15,9 +62,13 @@ def render(events: List[RoundSummary], cap_tables: List[Dict[str, float]], raw_d
         exit_amount = st.number_input("Exit-Erlös (EUR)", min_value=0.0, value=10_000_000.0, step=100_000.0, format="%f")
     with colx2:
         exit_date = st.date_input("Exit-Datum", value=date.today())
-    if st.button("Simulation starten", type="primary"):
-        final_cap = cap_tables[-1] if cap_tables else {}
-        result = simulate_exit_proceeds(exit_amount, exit_date, final_cap, raw_data, liq_terms)
+    final_cap = cap_tables[-1] if cap_tables else {}
+    # Run simulation reactively (no button) so UI doesn't collapse when controls change
+    result = simulate_exit_proceeds(exit_amount, exit_date, final_cap, raw_data, liq_terms)
+    # --------------------------------------------------------------
+    # RESULTS BLOCK
+    # --------------------------------------------------------------
+    with st.container():
         payouts_lp = result.get("payouts_lp", {}) or {}
         payouts_part = result.get("payouts_participation", {}) or {}
         # Aggregate LP & participation totals
@@ -106,3 +157,74 @@ def render(events: List[RoundSummary], cap_tables: List[Dict[str, float]], raw_d
             st.warning(f"Nicht zugeordnet (Rest): {money_fmt(result['unallocated'])}")
         else:
             st.success("Gesamterlös vollständig verteilt.")
+
+        # ------------------------------------------------------------------
+        # Sensitivitätsanalyse für ausgewählten Investor-Subset
+        # ------------------------------------------------------------------
+    st.markdown("**Sensitivitätsanalyse: Proceeds je Holder über Exit-Spanne**")
+    if result.get("totals"):
+            all_holders = sorted(result["totals"].keys())
+            default_selection = all_holders[:3]
+            chosen = st.multiselect(
+                "Wähle Holder", all_holders, default=default_selection, help="Ein Chart pro ausgewähltem Holder."
+            )
+            colr1, colr2, colr3 = st.columns([1,1,1])
+            with colr1:
+                sens_width = st.number_input(
+                    "Spanne (+/- €)", min_value=0.0, value=10_000_000.0, step=1_000_000.0, help="Halbe Breite der Exit-Spanne um den gewählten Exit."  # noqa: E501
+                )
+            with colr2:
+                sens_steps = st.number_input(
+                    "Anzahl Schritte", min_value=2, value=21, step=1, help="Anzahl diskreter Exit-Beträge in der Spanne."
+                )
+            with colr3:
+                show_pct = st.checkbox("% Anteil anzeigen", value=False)
+
+            if chosen:
+                df_sens = _holder_proceeds_sensitivity(
+                    exit_amount, sens_width, sens_steps, chosen, exit_date, final_cap, raw_data, liq_terms
+                )
+                for holder in chosen:
+                    df_h = df_sens[df_sens["Holder"] == holder].copy()
+                    df_h["Exit (fmt)"] = df_h["Exit (€)"].map(money_fmt)
+                    df_h["Proceeds (fmt)"] = df_h["Proceeds (€)"].map(money_fmt)
+                    df_h["Multiple (x) fmt"] = df_h["Multiple (x)"].map(lambda x: f"{x:.2f}x" if x == x else "–")
+                    if show_pct:
+                        chart = (
+                            alt.Chart(df_h)
+                            .mark_line(point=alt.OverlayMarkDef(filled=True, size=60))
+                            .encode(
+                                x=alt.X("Exit (€):Q", title="Exit (€)"),
+                                y=alt.Y("Anteil Gesamt %:Q", title="Anteil am Gesamterlös (%)"),
+                                tooltip=[
+                                    alt.Tooltip("Exit (€):Q", format=",.0f"),
+                                    alt.Tooltip("Proceeds (€):Q", format=",.0f", title="Proceeds €"),
+                                    alt.Tooltip("Anteil Gesamt %:Q", format=".2f"),
+                                    alt.Tooltip("Multiple (x):Q", format=".2f"),
+                                ],
+                            )
+                        )
+                    else:
+                        chart = (
+                            alt.Chart(df_h)
+                            .mark_line(point=alt.OverlayMarkDef(filled=True, size=60))
+                            .encode(
+                                x=alt.X("Exit (€):Q", title="Exit (€)"),
+                                y=alt.Y("Proceeds (€):Q", title="Auszahlung (€)"),
+                                tooltip=[
+                                    alt.Tooltip("Exit (€):Q", format=",.0f"),
+                                    alt.Tooltip("Proceeds (€):Q", format=",.0f", title="Proceeds €"),
+                                    alt.Tooltip("Anteil Gesamt %:Q", format=".2f"),
+                                    alt.Tooltip("Multiple (x):Q", format=".2f"),
+                                ],
+                            )
+                        )
+                    st.markdown(f"Holder: **{holder}**")
+                    st.altair_chart(chart.properties(height=260), use_container_width=True)
+                    with st.expander(f"Tabellarische Werte – {holder}"):
+                        st.dataframe(
+                            df_h[["Exit (fmt)", "Proceeds (fmt)", "Anteil Gesamt %", "Multiple (x) fmt"]],
+                            use_container_width=True,
+                        )
+            else:
+                st.info("Bitte mindestens einen Holder wählen.")
